@@ -1,0 +1,201 @@
+---
+title: "Trolls regression analysis"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+This notebook walks through the analysis of the ~1.2 million tweet database consisting of tweets from IRA-linked twitter accounts and from accounts belonging to the legitimate news sources from which the IRA drew. The analysis uses meta-data provided by IBM Watson's Natural Language Understanding (NLU) service. In particular, the analysis uses, for each tweet, the sentiment score (a number in the interval [-1,1]), and five emotion scores (anger, disgust, fear, joy, and sadness, each a number in the interval [0,1]).
+
+The analysis here uses cluster-robust standard errors to perform z-tests on each of the regression coefficients. The clusters used for this purpose are the stratification levels, which are location-month pairs. We find that IRA tweets are associated with lower sentiment, lower joy, higher anger, higher disgust, higher fear, and higher sadness than the control tweets.
+
+First, we clear the workspace and define some helper functions which will be used to transform the Watson NLU scores from their bounded intervals to unbounded real numbers. `sentiment01()` will convert the sentiment score from the interval [-1,1] to the interval [0,1]. `logit_transform()` will be used to perform the logit transform $x\to \log\left(\frac {x}{1-x}\right)$ on each of the transformed sentiment score and the five emotion scores. In addition, prior to performing the logit transform, `logit_transform` shrinks each score from the interval [0,1] to the interval [$\epsilon$, $1-\epsilon$], where $\epsilon$ is the [machine epsilon](https://en.wikipedia.org/wiki/Machine_epsilon). This ensures that all resulting logit-transformed values are finite.
+
+```{r}
+rm(list=ls()) # clear workspace
+
+# Helper functions
+logit_transform <- function(p){
+  # This function performs a logit transform after shrinking a
+  # [0,1] input to [epsilon,1-epsilon] for tiny epsilon.
+  # The logit transform is to remove the boundaries of the input,
+  # so that it is not confined to [0,1]. Thus it more closely
+  # approximates the normal.
+  # The shrinking is because logit(0) and logit(1) give -Inf, Inf.
+  epsilon <- .Machine$double.eps
+  shrunkp <- p * (1-2*epsilon) + epsilon
+  return(log(shrunkp/(1-shrunkp)))
+}
+sentiment01 <- function(s) {(s+1)/2} # Put sent. score on 0-1 scale
+```
+
+## Loading and examining the data
+
+Next we load in the data and take a look at it.
+
+```{r tidy=TRUE}
+# Load in the data
+dat <- read.csv('./2020-02-26_tweets-and-nlu-results_complete-set.csv',
+  colClasses=c("tweet_id"="character"))
+head(dat)
+```
+
+Next we check for missing values. 
+
+```{r tidy=TRUE}
+# Check for NAs
+data.frame(names(dat),apply(dat,2,function(x) sum(is.na(x))))
+```
+
+We see that sentiment score is missing from 932 cases, and emotion scores are missing from 102,537 cases. We now investigate these cases further. In the following code block, we examine the language of these tweets with missing emotion data, on the theory that Watson's failure to supply emotion scores may be due to these being in a language with which Watson is not compatible. And indeed we see that many of these tweets are non-english, and many of them are such that Watson was unable to determine their language. However, the vast of them are in English.
+```{r tidy=TRUE}
+table(dat$language[is.na(dat$emotion_anger)])
+```
+
+Watson's output includes `nlu_status`, which is an indicator for whether Watson NLU was successfully completed on the tweet. We therefore check `nlu_status` for the tweets with missing emotion scores:
+```{r}
+table(dat$nlu_status[is.na(dat$emotion_anger)])
+```
+
+We see that many of these cases of missing emotion scores correspond to failed Watson NLU (the same number, in fact, as were not assigned a language), but the overwhelming majority of them are scored as `pass`. It is unclear why there would be missing emotion scores for these tweets, given that they pass Watson NLU.
+
+As a final method of examinining these tweets in English with `nlu_status = pass` and missing emotion scores, we can read a sample of them directly, in the below code:
+```{r}
+print(head(dat$text[is.na(dat$emotion_anger) & dat$language=='en' & dat$nlu_status=='pass']))
+print(tail(dat$text[is.na(dat$emotion_anger) & dat$language=='en' & dat$nlu_status=='pass']))
+```
+
+## Preprocessing
+
+There is no obvious reason why these tweets should lack emotion scores. It remains mysterious why these tweets lack emotion scores. They amount to roughly 8% of the total tweets. For now, we remove them. It would be preferable to explain their lack of emotion scores.
+```{r}
+dat <- na.omit(dat)
+```
+
+The data frame contains many columns we don't need, which require a great deal of computer memory. To ease the later computations, we delete some unneeded columns:
+```{r}
+keepers <- c("tweet_id","is_ira","stratify","sentiment_score",
+             "emotion_anger","emotion_disgust","emotion_fear",
+             "emotion_joy","emotion_sadness")
+dat <- dat[,keepers]
+```
+
+Some tweets are in multiple stratify groups. We can see how many using the following code.
+```{r}
+print(dim(dat)[1]-dim(unique(dat[,names(dat)!='stratify']))[1])
+```
+
+If every tweet were in only a single stratify group, we could use ordinary one-hot encoding for the stratify feature. Since some tweets are in multiple groups, we will instead use "n-hot encoding", as follows. We will create a column in our data frame for each of the stratify groups. For each tweet, for each stratify column, the value of the element will be 1 if the tweet is in the corresponding stratify group, and 0 otherwise. Note that this means that tweets that are in multiple stratify groups will have 1 entries in multiple of these stratify columns. The following code performs this "n-hot encoding", after first saving the stratify labels in a separate `dat.stratify`.
+```{r warning=FALSE, message=FALSE, results='hide'}
+# Save the stratify labels and tweet_id
+dat.stratify <- dat[,c('tweet_id','stratify')]
+
+# Create all the dummy columns. This takes a while
+library(dummies)
+dat <- dummy.data.frame(dat,names="stratify",sep="_",verbose=TRUE)
+
+# Aggregate stratify columns by sum, grouped by tweet_id
+library(dplyr)
+
+dat <- dat %>% group_by(tweet_id,is_ira,sentiment_score,
+                             emotion_anger,emotion_disgust,emotion_fear,
+                             emotion_joy,emotion_sadness) %>%
+  summarise_at( names(dat)[grepl("stratify",names(dat))] ,sum)
+```
+
+Earlier attempts at analysis ran afoul of what was eventually found to be a duplicate stratify label. Existence of duplicate proven here, after which we correct the problems by simply deleting one of the two columns in question.
+```{r}
+ds226 <- dat$tweet_id[dat$stratify_226==1]
+ds240 <- dat$tweet_id[dat$stratify_240==1]
+print(all(ds226==ds240)) # TRUE
+rm(ds226,ds240)
+
+# Remove group 240
+dat <- dat[,!names(dat)=='stratify_240']
+```
+
+Since we're storing stratify group labels in `dat.stratify`, we need to update that data frame as well, so that it matches row-by-row with the transformed version of `dat` that we created earlier. We do that now:
+```{r}
+dat.stratify <- dat.stratify %>% group_by(tweet_id) %>%
+  summarise_at( "stratify" , first)
+# Make sure we didn't pick up any 240's:
+print(sum(dat.stratify$stratify==240))
+```
+
+Now we perform the transformations of sentiment score and the emotion scores from their original [-1,1] and [0,1] bounds, to have support over all real numbers. See above description of the logit transform for details.
+```{r}
+# Convert sentiment score to logit scale
+dat$sentiment_score <- 
+  logit_transform(sentiment01(dat$sentiment_score))
+
+# Convert each emotion score to logit scale
+dat$emotion_anger <- logit_transform(dat$emotion_anger)
+dat$emotion_disgust <- logit_transform(dat$emotion_disgust)
+dat$emotion_fear <- logit_transform(dat$emotion_fear)
+dat$emotion_joy <- logit_transform(dat$emotion_joy)
+dat$emotion_sadness <- logit_transform(dat$emotion_sadness)
+head(as.data.frame(dat[,1:8]))
+```
+
+## The analysis
+
+Now we prepare to perform the regression analysis by defining our dependent variables (`targets`) and our covariates (`is_ira`, plus all the stratify dummy variables). We also load the packages needed to perform and view the analysis. Package `biglm` is necessary due to the size of the data set, which is otherwise computationally difficult to analyze. Using `biglm`, we can fit the OLS model piecemeal, using a bit of the data at a time. This produces an `biglm` object which cannot be used with standard `R` tools for cluster robust standard errors, and as a result, we also load the `bigcluster_sandwich` tools for performing cluster robust standard error analysis on a `biglm` object.
+```{r warning=FALSE, results='hide', message=FALSE}
+# Perform the analysis
+targets <- c("sentiment_score","emotion_anger","emotion_disgust",
+             "emotion_fear","emotion_joy","emotion_sadness")
+covariates <- c(names(dat)[grep('stratify',names(dat))],"is_ira")
+
+library(tidyr)
+library(broom)
+library(biglm)
+library(lmtest)
+source('../Downloads/bigcluster_sandwich.R')
+```
+
+Finally, the below loop performs the regression analysis. For each of the six dependent variables, the loop fits a `biglm` OLS model, then uses `BigCluster` to get the cluster robust standard errors of the regression coefficients. We use the 'HC0' estimator to obtain the cluster robust standard errors. That is: where $e_i$ is the residual for the $i^\text{th}$ observation, the estimated covariance of the regression coefficients $\widehat\beta$ is given by:
+$$
+\mathrm{Var}(\widehat\beta) = (X^TX)^{-1}X^T \widehat\Omega X(X^TX)^{-1},\quad \widehat\Omega=\mathrm{diag}(E_i,i=1,\ldots,k)
+$$
+where $k$ is the number of clusters and $E_i$ is the sample covariance of the residuals from the $i^\text{th}$ cluster (for more information, see [MacKinnon, J. G., & White, H. (1985)](http://qed.econ.queensu.ca/working_papers/papers/qed_wp_537.pdf)). Then `coeftest` is used, along with the output of `BigCluster`, to find the p-value for the hypothesis that the regression coefficient for the covariate `is_ira` is zero. Finally, the (very conservative) Bonferroni correction is applied to account for the fact that we are performing six simultaneous tests. Note that the clusters used here are the stratify groups themselves, which are location-month pairs.
+
+```{r warning=FALSE}
+for (target in targets) {
+  reg_formula = paste0(target,' ~ ',paste(covariates,collapse='+'))
+  # Fit model. Too big, have to do it in chunks.
+  maxrows <- 100000
+  mod <- biglm(data = dat[1:maxrows,c(target,covariates)],
+               as.formula(reg_formula))
+  for (i in 2:floor(dim(dat)[1]/maxrows) ) {
+    mod <- update(mod, dat[ ((i-1)*maxrows+1):(i*maxrows) ,
+                            c(target,covariates)])
+  }
+  mod <- update(mod, dat[(i*maxrows+1):(dim(dat)[1]),
+                         c(target,covariates)])
+  
+  # Now get vcov matric for cluster robust se's:
+  bigvcov <- BigCluster(mod, as.data.frame(dat.stratify$stratify), 
+                        dataFrame=as.data.frame(
+                          dat[,c(target,covariates)]), sumMethod = "slow")
+
+  # Get Bonferroni correction of is_ira p-values
+  
+  cat(paste(paste(rep('=',60),collapse = ""),
+            "\n\nREGRESSION RESULTS FOR ",target,":\n",
+            paste(rep('=',60),collapse = ""),"\n",sep=""))
+  coef_isira <- coef(mod)[['is_ira']]
+  cat(paste("REGRESSION COEFFICIENT FOR is_ira: ",
+            signif(coef_isira,digits = 3),"\n",sep=""))
+  pval <- coeftest(mod,bigvcov)['is_ira','Pr(>|z|)']
+  bfcpval <- p.adjust(pval,"bonferroni",6)
+  # Print adjusted p-values
+  cat(paste("BONFERRONI CORRECTED, CLUSTER ROBUST p-value FOR is_ira: ",
+            signif(bfcpval,digits = 3),"\n",sep=""))
+
+  
+}
+```
+
+From the results, we see that `is_ira` is significant for each of our six independent variables, such that IRA tweets have lower sentiment and joy, and higher anger, disgust, fear, and sadness than the control tweets.
+
